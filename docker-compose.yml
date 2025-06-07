@@ -12,8 +12,6 @@ services:
     # Bind‐mount the host's Docker socket so the watcher can inspect/restart containers.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./restart_logs:/app/restart.logs
-      - ./watcher.log:/app/watcher.log
       - ./:/app
     tty: true  
 
