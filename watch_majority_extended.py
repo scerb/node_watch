@@ -150,7 +150,7 @@ def main():
     WARMUP_SECONDS = 3 * 60  # 3 minutes
 
     # ─── Version check initialization ─────────────────────────────────────────
-    local_version      = "v1.0.0"
+    local_version      = "v1.0.1"
     version_api        = "https://api.github.com/repos/scerb/node_watch/releases/latest"
     last_version_check = start_time - timedelta(days=1)  # force initial check
     remote_version     = ""
