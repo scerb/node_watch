@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: watch_majority:latest
+    image: node_watch:latest
     container_name: node_watch
     restart: unless-stopped
 
