@@ -91,7 +91,7 @@ LOG_STATE_RE       = re.compile(r"Latest ID:\s*(\d+)\s*/\s*Latest State:\s*(\d+)
 ASSIGNED_RE        = re.compile(r"Assigned Miners:\s*(.*)")
 TX_RE              = re.compile(r"TX:\s*(0x[0-9a-fA-F]+)")
 LOG_EVENT_RE       = re.compile(r"\* Event:\s*(\S+)")
-PING_FAIL_PATTERN  = "Pinging network..."
+PING_FAIL_PATTERN  = "Load ping thresholds..."
 
 def rpc_get_receipt(rpc_url: str, tx_hash: str, timeout: float = 5.0):
     """
