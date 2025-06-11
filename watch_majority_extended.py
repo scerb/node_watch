@@ -18,6 +18,8 @@ Monitors multiple Docker containers (“miners”) and:
 6) **If “Pinging network…” appears ≥ 2 times within the last 52 lines of logs, we immediately dump
    its last 500 lines and restart.**
 
+New: **If “Traceback (most recent call last):” appears anywhere in the last logs, dump last 500 logs and restart.**
+
 “Warm-up” is defined as 3 minutes (180 s) from when this watcher script starts.
 After 3 minutes have elapsed, all containers are considered warmed-up, regardless of TX success.
 
@@ -91,13 +93,15 @@ LOG_STATE_RE       = re.compile(r"Latest ID:\s*(\d+)\s*/\s*Latest State:\s*(\d+)
 ASSIGNED_RE        = re.compile(r"Assigned Miners:\s*(.*)")
 TX_RE              = re.compile(r"TX:\s*(0x[0-9a-fA-F]+)")
 LOG_EVENT_RE       = re.compile(r"\* Event:\s*(\S+)")
-PING_FAIL_PATTERN  = "Load ping thresholds..."
+PING_FAIL_PATTERN  = "Pinging network..."
+TRACEBACK_PATTERN  = "Traceback (most recent call last):"
+
 
 def rpc_get_receipt(rpc_url: str, tx_hash: str, timeout: float = 5.0):
     """
     Single JSON-RPC call to eth_getTransactionReceipt.
     Returns the parsed JSON “result” field (a dict) if found,
-    or None if the node replies but the “receipt” is still null,
+    or None if the node replies but the "receipt" is still null,
     or None on network errors.
     """
     payload = {
@@ -113,6 +117,7 @@ def rpc_get_receipt(rpc_url: str, tx_hash: str, timeout: float = 5.0):
     except Exception:
         return None
 
+
 def find_latest_assigned_stage(log_lines: list[str], miner_addr: str, state_code: int, lookahead: int = 20):
     idx_found = None
     for idx, ln in enumerate(log_lines):
@@ -125,6 +130,7 @@ def find_latest_assigned_stage(log_lines: list[str], miner_addr: str, state_code
                     if miner_addr.lower() in assigned:
                         idx_found = idx
     return idx_found
+
 
 def find_first_tx_after(log_lines: list[str], start_idx: int):
     for ln in log_lines[start_idx:]:
@@ -150,13 +156,11 @@ def main():
     WARMUP_SECONDS = 3 * 60  # 3 minutes
 
     # ─── Version check initialization ─────────────────────────────────────────
-    local_version      = "v1.0.3"
+    local_version      = "v1.0.4"
     version_api        = "https://api.github.com/repos/scerb/node_watch/releases/latest"
-    last_version_check = start_time - timedelta(days=1)  # force initial check
+    last_version_check = start_time - timedelta(days=1)
     remote_version     = ""
     version_status     = ""
-
-    # Initial version fetch
     try:
         resp = requests.get(version_api, timeout=10)
         resp.raise_for_status()
@@ -164,46 +168,33 @@ def main():
         remote_version = data.get("tag_name", "") or ""
     except Exception:
         remote_version = ""
-    if remote_version == local_version:
-        version_status = "latest"
-    else:
-        version_status = f"please update ({remote_version})" if remote_version else "unknown"
+    version_status = "latest" if remote_version == local_version else (f"please update ({remote_version})" if remote_version else "unknown")
     last_version_check = start_time
     # ─────────────────────────────────────────────────────────────────────────
 
     # Prepare output dirs & files
     log_dir = Path("restart_logs"); log_dir.mkdir(exist_ok=True)
     master_log = Path("watcher.log")
-    if not master_log.exists():
-        master_log.write_text("")
+    if not master_log.exists(): master_log.write_text("")
 
-    # Connect to Docker
+    # Connect to Docker daemon
     try:
         client = docker.from_env()
     except Exception as e:
         print(f"Error: cannot connect to Docker daemon: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 1) Majority logic state
+    # Initialize state
     first_deviation = {}
-
-    # 2) Per-container TX-FSM state
-    tx_state      = {cid: 0 for cid in containers}
-    tx_seen       = {cid: {"pre": False, "commit": False} for cid in containers}
+    stall_start    = {}
+    tx_state       = {cid: 0 for cid in containers}
+    tx_seen        = {cid: {"pre": False, "commit": False} for cid in containers}
     tx_deadline_pre    = {cid: None for cid in containers}
     tx_deadline_commit = {cid: None for cid in containers}
-
-    # 3) “Warmed-up” flags, now driven by time elapsed
-    warmed_up = {cid: False for cid in containers}
-
-    # 4) Pending TX checks: maps cid -> info dict
-    pending_checks = {}
-
-    # 5) Track last TX message per container
-    last_tx_message = {cid: "(no TX yet)" for cid in containers}
-
-    # 6) Track previous Latest ID per container, so we can detect “new session”
-    prev_id_val = {cid: None for cid in containers}
+    warmed_up          = {cid: False for cid in containers}
+    pending_checks     = {}
+    last_tx_message    = {cid: "(no TX yet)" for cid in containers}
+    prev_id_val        = {cid: None for cid in containers}
 
     print("Starting watcher (majority + 5s-delayed TX checks; warm-up = 3 min)…")
     print("Press Ctrl+C to exit.\n")
@@ -222,23 +213,44 @@ def main():
                     remote_version = data.get("tag_name", "") or ""
                 except Exception:
                     remote_version = ""
-                if remote_version == local_version:
-                    version_status = "latest"
-                else:
-                    version_status = f"please update ({remote_version})" if remote_version else "unknown"
+                version_status = "latest" if remote_version == local_version else (f"please update ({remote_version})" if remote_version else "unknown")
                 last_version_check = now
 
-            # Update warmed_up flags based solely on elapsed time
+            # Update warmed_up flags based on elapsed time
             elapsed_total = (now - start_time).total_seconds()
             if elapsed_total >= WARMUP_SECONDS:
                 for cid in containers:
-                    if not warmed_up[cid]:
-                        warmed_up[cid] = True
+                    warmed_up[cid] = True
 
-            # Header now includes version info
+            # Fetch remote session ID from API
+            try:
+                resp = requests.get("https://lb-be-5.cortensor.network/network-stats-tasks", timeout=10)
+                resp.raise_for_status()
+                api_data = resp.json()
+                # Handle stats wrapper
+                stats_container = api_data.get("stats", api_data.get("data", api_data))
+                # Filter only entries with a valid session_id
+                entries = {
+                    k: v for k, v in stats_container.items()
+                    if isinstance(v, dict) and "session_id" in v
+                }
+                session_ids = []
+                for v in entries.values():
+                    sid = v["session_id"]
+                    try:
+                        session_ids.append(int(sid))
+                    except (ValueError, TypeError):
+                        continue
+                remote_session_id = max(session_ids) if session_ids else None
+            except Exception:
+                remote_session_id = None
+
+            # Print header with session ID
             header = (
-                f"=== {now.isoformat()} UTC  |  version {local_version} ({version_status})"
-                f"  |  interval={interval}s  |  grace={grace}s"
+                f"=== {now.isoformat()} UTC"
+                f"  |  last complete session_id={remote_session_id}"  # session ID shown
+                f"  |  version {local_version} ({version_status})"
+                f"  |  interval={interval}s  grace={grace}s"
                 f"  |  warmed_up={int(elapsed_total)}s/180s ===\n"
             )
             print(header)
@@ -262,36 +274,38 @@ def main():
                     print(f"[ERROR] Failed to fetch logs for '{cid}': {e}")
                     continue
 
+                # New: detect Python traceback
+                if any(TRACEBACK_PATTERN in ln for ln in log_lines):
+                    ts_str = now.strftime("%Y%m%dT%H%M%S")
+                    try: pre_bytes = container.logs(tail=500, timestamps=False); pre_text = pre_bytes.decode("utf-8", errors="ignore")
+                    except: pre_text = "[ERROR capturing logs]\n"
+                    outfile = log_dir / f"{cid}_traceback_{ts_str}.log"
+                    try: outfile.write_text(pre_text, encoding="utf-8")
+                    except Exception as e: print(f"[{cid}] ✘ Could not write traceback log: {e}")
+                    entry = f"{now.is8601()} UTC  Restarted '{cid}' (traceback) → '{outfile.name}'\n"
+                    try: master_log.write_text(master_log.read_text()+entry, encoding="utf-8")
+                    except Exception as e: print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                    try: container.restart(); print(f"[{cid}] ✔ Restarted due to Python traceback detected in logs")
+                    except Exception as e: print(f"[{cid}] ✘ Restart failed: {e}")
+                    continue
+
+                # Existing pingfail logic...
                 recent_window = log_lines[-52:]
                 ping_matches = sum(1 for ln in recent_window if ln.strip().startswith(PING_FAIL_PATTERN))
                 if ping_matches >= 2:
                     ts_str = now.strftime("%Y%m%dT%H%M%S")
-                    try:
-                        pre_bytes = container.logs(tail=500, timestamps=False)
-                        pre_text  = pre_bytes.decode("utf-8", errors="ignore")
-                    except:
-                        pre_text = "[ERROR capturing logs]\n"
-
+                    try: pre_bytes = container.logs(tail=500, timestamps=False); pre_text = pre_bytes.decode("utf-8", errors="ignore")
+                    except: pre_text = "[ERROR capturing logs]\n"
                     outfile = log_dir / f"{cid}_pingfail_{ts_str}.log"
-                    try:
-                        with open(outfile, "w", encoding="utf-8") as wf:
-                            wf.write(pre_text)
-                    except Exception as e:
-                        print(f"[{cid}] ✘ Could not write pingfail log: {e}")
-
-                    entry = f"{now.isoformat()} UTC  Restarted '{cid}' (pingfail) → '{outfile.name}'\n"
-                    try:
-                        with open(master_log, "a", encoding="utf-8") as mf:
-                            mf.write(entry)
-                    except Exception as e:
-                        print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
-
-                    try:
-                        container.restart()
-                        print(f"[{cid}] ✔ Restarted due to repeated “Pinging network…” (found {ping_matches} in last 52 lines)")
-                    except Exception as e:
-                        print(f"[{cid}] ✘ Restart failed: {e}")
+                    try: outfile.write_text(pre_text, encoding="utf-8")
+                    except Exception as e: print(f"[{cid}] ✘ Could not write pingfail log: {e}")
+                    entry = f"{now.is8601()} UTC  Restarted '{cid}' (pingfail) → '{outfile.name}'\n"
+                    try: master_log.write_text(master_log.read_text()+entry, encoding="utf-8")
+                    except Exception as e: print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                    try: container.restart(); print(f"[{cid}] ✔ Restarted due to repeated “Pinging network…”")
+                    except Exception as e: print(f"[{cid}] ✘ Restart failed: {e}")
                     continue
+
 
                 last = None
                 for ln in log_lines:
@@ -325,8 +339,7 @@ def main():
                             note = f"{now.isoformat()} UTC  Restarted missing container '{cid}' (majority=6)\n"
                         except Exception as e:
                             note = f"{now.isoformat()} UTC  Failed restart missing '{cid}' (majority=6): {e}\n"
-                        with open(master_log, "a", encoding="utf-8") as mf:
-                            mf.write(note)
+                        master_log.write_text(master_log.read_text() + note, encoding="utf-8")
                         print(f"[{cid}] ✘ Not found → attempted restart")
                         continue
 
@@ -339,20 +352,18 @@ def main():
                         ts_str = now.strftime("%Y%m%dT%H%M%S")
                         outfile = log_dir / f"{cid}_inactive_{ts_str}.log"
                         try:
-                            with open(outfile, "w", encoding="utf-8") as wf:
-                                wf.write(pre_text)
+                            outfile.write_text(pre_text, encoding="utf-8")
                         except Exception as e:
                             print(f"[{cid}] ✘ Could not write inactive log: {e}")
                         try:
                             c.restart()
                             note = f"{now.isoformat()} UTC  Restarted '{cid}' (inactive, majority=6) → '{outfile.name}'\n"
-                            with open(master_log, "a", encoding="utf-8") as mf:
-                                mf.write(note)
+                            master_log.write_text(master_log.read_text() + note, encoding="utf-8")
                             print(f"[{cid}] ✔ Restarted inactive container (majority=6)")
                         except Exception as e:
                             print(f"[{cid}] ✘ Failed to restart inactive container: {e}")
 
-            # ── 3) Display each container’s status line + last TX, and check for new session
+            # ── 3) Display each container’s status line + last TX, and check for new session & stalls
             for cid in containers:
                 if cid not in results:
                     print(f"[{cid}] (no data)")
@@ -361,13 +372,49 @@ def main():
 
                 id_val, state_val, raw_text, log_lines, container = results[cid]
 
+                # ── Stalled‐session logic
+                if remote_session_id is not None and remote_session_id > id_val:
+                    if cid not in stall_start:
+                        stall_start[cid] = now
+                        print(f"[{cid}] ⚠ first stall detected at {now.strftime('%H:%M:%S')} (API {remote_session_id} > local {id_val})")
+                    else:
+                        elapsed_stall = (now - stall_start[cid]).total_seconds()
+                        if elapsed_stall >= grace:
+                            if warmed_up[cid]:
+                                print(f"[{cid}] ↳ stalled {int(elapsed_stall)}s ≥ {int(grace)}s → restarting (API session {remote_session_id} > local {id_val})")
+                                try:
+                                    pre_bytes = container.logs(tail=500, timestamps=False)
+                                    pre_text  = pre_bytes.decode("utf-8", errors="ignore")
+                                except:
+                                    pre_text = "[ERROR capturing logs]\n"
+                                ts_str = now.strftime("%Y%m%dT%H%M%S")
+                                outfile = log_dir / f"{cid}_stalled_{ts_str}.log"
+                                try:
+                                    outfile.write_text(pre_text, encoding="utf-8")
+                                except Exception as e:
+                                    print(f"[{cid}] ✘ Could not write stalled log: {e}")
+                                entry = f"{now.isoformat()} UTC  Restarted '{cid}' (stalled) → '{outfile.name}'\n"
+                                master_log.write_text(master_log.read_text() + entry, encoding="utf-8")
+                                try:
+                                    container.restart()
+                                    print(f"[{cid}] ✔ Restarted due to stalled session")
+                                except Exception as e:
+                                    print(f"[{cid}] ✘ Restart failed: {e}")
+                            else:
+                                print(f"[{cid}] ⚠ stalled detected but not warmed up → skipping restart")
+                            del stall_start[cid]
+                    continue
+                else:
+                    stall_start.pop(cid, None)
+
+                # Detect new session
                 if prev_id_val[cid] is None:
                     prev_id_val[cid] = id_val
                 elif prev_id_val[cid] != id_val:
                     print(f"[{cid}] → New session detected: ID changed {prev_id_val[cid]} → {id_val}")
                     print(f"    Last TX status: {last_tx_message[cid]}")
                     prev_id_val[cid] = id_val
-
+                    # Reset TX-FSM
                     tx_state[cid]           = 0
                     tx_seen[cid]["pre"]     = False
                     tx_seen[cid]["commit"]  = False
@@ -375,6 +422,7 @@ def main():
                     tx_deadline_commit[cid] = None
                     pending_checks.pop(cid, None)
 
+                # Majority-lag logic
                 this_pair = (id_val, state_val)
                 if this_pair == majority_pair:
                     if cid in first_deviation:
@@ -397,16 +445,11 @@ def main():
                                 ts_str = now.strftime("%Y%m%dT%H%M%S")
                                 outfile = log_dir / f"{cid}_lag_{ts_str}.log"
                                 try:
-                                    with open(outfile, "w", encoding="utf-8") as wf:
-                                        wf.write(pre_text)
+                                    outfile.write_text(pre_text, encoding="utf-8")
                                 except Exception as e:
                                     print(f"[{cid}] ✘ Could not write restart log: {e}")
                                 entry = f"{now.isoformat()} UTC  Restarted '{cid}' (lag) → '{outfile.name}'\n"
-                                try:
-                                    with open(master_log, "a", encoding="utf-8") as mf:
-                                        mf.write(entry)
-                                except Exception as e:
-                                    print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                                master_log.write_text(master_log.read_text() + entry, encoding="utf-8")
                                 try:
                                     container.restart()
                                     print(f"[{cid}] ✔ Restarted due to majority lag")
@@ -490,16 +533,11 @@ def main():
                             ts_str = now.strftime("%Y%m%dT%H%M%S")
                             outfile = log_dir / f"{cid}_txtimeout_pre_{ts_str}.log"
                             try:
-                                with open(outfile, "w", encoding="utf-8") as wf:
-                                    wf.write(pre_text)
+                                outfile.write_text(pre_text, encoding="utf-8")
                             except Exception as e:
                                 print(f"[{cid}] ✘ Could not write timeout log: {e}")
                             entry = f"{now.isoformat()} UTC  Restarted '{cid}' (pre_timeout) → '{outfile.name}'\n"
-                            try:
-                                with open(master_log, "a", encoding="utf-8") as mf:
-                                    mf.write(entry)
-                            except Exception as e:
-                                print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                            master_log.write_text(master_log.read_text() + entry, encoding="utf-8")
                             try:
                                 container.restart()
                                 print(f"[{cid}] ✔ Restarted due to precommit timeout")
@@ -546,16 +584,11 @@ def main():
                             ts_str = now.strftime("%Y%m%dT%H%M%S")
                             outfile = log_dir / f"{cid}_txtimeout_commit_{ts_str}.log"
                             try:
-                                with open(outfile, "w", encoding="utf-8") as wf:
-                                    wf.write(pre_text)
+                                outfile.write_text(pre_text, encoding="utf-8")
                             except Exception as e:
                                 print(f"[{cid}] ✘ Could not write timeout log: {e}")
                             entry = f"{now.isoformat()} UTC  Restarted '{cid}' (commit_timeout) → '{outfile.name}'\n"
-                            try:
-                                with open(master_log, "a", encoding="utf-8") as mf:
-                                    mf.write(entry)
-                            except Exception as e:
-                                print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                            master_log.write_text(master_log.read_text() + entry, encoding="utf-8")
                             try:
                                 container.restart()
                                 print(f"[{cid}] ✔ Restarted due to commit timeout")
@@ -574,7 +607,7 @@ def main():
                 if tx_state[cid] == 4:
                     pass
 
-            # ── 5) Process any pending_checks if their next_check time has passed
+            # ── 5) Process pending_checks
             for cid, info in list(pending_checks.items()):
                 tx_hash   = info["tx"]
                 next_chk  = info["next_check"]
@@ -613,7 +646,6 @@ def main():
                         print(f"[{cid}] {msg}")
                         last_tx_message[cid] = msg
 
-                        _, _, raw_text, _, container = results[cid]
                         try:
                             pre_bytes = container.logs(tail=500, timestamps=False)
                             pre_text  = pre_bytes.decode("utf-8", errors="ignore")
@@ -623,16 +655,11 @@ def main():
                         suffix = f"txfail_{tx_type}_{tx_hash[:8]}_{ts_str}"
                         outfile = log_dir / f"{cid}_{suffix}.log"
                         try:
-                            with open(outfile, "w", encoding="utf-8") as wf:
-                                wf.write(pre_text)
+                            outfile.write_text(pre_text, encoding="utf-8")
                         except Exception as e:
                             print(f"[{cid}] ✘ Could not write failure log: {e}")
                         entry = f"{now.isoformat()} UTC  Restarted '{cid}' ({reason}) → '{outfile.name}'\n"
-                        try:
-                            with open(master_log, "a", encoding="utf-8") as mf:
-                                mf.write(entry)
-                        except Exception as e:
-                            print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
+                        master_log.write_text(master_log.read_text() + entry, encoding="utf-8")
                         try:
                             container.restart()
                             print(f"[{cid}] ✔ Restarted due to {reason}")
