@@ -11,6 +11,7 @@
   "check_interval_seconds": 2.5,
   "grace_period_seconds": 30,
   "rpc_url": "your_favourite_rpc",
+  "stats_api_url": "https://lb-be-5.cortensor.network/network-stats-tasks",
   "watch_tx_for_containers": [
     "cortensor-1",
     "cortensor-2"
