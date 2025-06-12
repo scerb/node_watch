@@ -72,6 +72,7 @@ def load_config(path="config.json"):
         ("check_interval_seconds", (int, float)),
         ("grace_period_seconds", (int, float)),
         ("rpc_url", str),
+        ("stats_api_url", str),
         ("watch_tx_for_containers", list),
         ("tx_timeout_seconds", (int, float)),
     ]
@@ -148,6 +149,7 @@ def main():
     interval            = float(cfg["check_interval_seconds"])
     grace               = float(cfg["grace_period_seconds"])
     rpc_url             = cfg["rpc_url"]
+    stats_url           = cfg["stats_api_url"]
     watch_tx_containers = set(cfg["watch_tx_for_containers"])
     tx_timeout          = float(cfg["tx_timeout_seconds"])
 
@@ -156,7 +158,7 @@ def main():
     WARMUP_SECONDS = 3 * 60  # 3 minutes
 
     # ─── Version check initialization ─────────────────────────────────────────
-    local_version      = "v1.0.5"
+    local_version      = "v1.0.6"
     version_api        = "https://api.github.com/repos/scerb/node_watch/releases/latest"
     last_version_check = start_time - timedelta(days=1)
     remote_version     = ""
@@ -222,28 +224,43 @@ def main():
                 for cid in containers:
                     warmed_up[cid] = True
 
-            # Fetch remote session ID from API
+            # ──  fetch remote session ID from API  ──────────────────────────────────────
             try:
-                resp = requests.get("https://lb-be-5.cortensor.network/network-stats-tasks", timeout=10)
+                resp = requests.get(stats_url, timeout=10)
                 resp.raise_for_status()
                 api_data = resp.json()
-                # Handle stats wrapper
-                stats_container = api_data.get("stats", api_data.get("data", api_data))
-                # Filter only entries with a valid session_id
+
+                # unwrap any top-level wrapper
+                stats = api_data.get("stats",
+                        api_data.get("data",
+                                     api_data))
+
+                # keep only the numeric-keyed session entries
                 entries = {
-                    k: v for k, v in stats_container.items()
+                    k: v
+                    for k, v in stats.items()
                     if isinstance(v, dict) and "session_id" in v
                 }
-                session_ids = []
-                for v in entries.values():
-                    sid = v["session_id"]
+
+                # pick the entry whose key (the ended_timestamp) is largest
+                max_ts = None
+                remote_session_id = None
+                for ts_str, rec in entries.items():
                     try:
-                        session_ids.append(int(sid))
-                    except (ValueError, TypeError):
+                        ts = int(ts_str)
+                    except ValueError:
                         continue
-                remote_session_id = max(session_ids) if session_ids else None
+                    if max_ts is None or ts > max_ts:
+                        max_ts = ts
+                        # coerce session_id to int in case it's a string
+                        try:
+                            remote_session_id = int(rec["session_id"])
+                        except (KeyError, TypeError, ValueError):
+                            remote_session_id = None
+
             except Exception:
                 remote_session_id = None
+
 
             # Print header with session ID
             header = (
@@ -282,7 +299,7 @@ def main():
                     outfile = log_dir / f"{cid}_traceback_{ts_str}.log"
                     try: outfile.write_text(pre_text, encoding="utf-8")
                     except Exception as e: print(f"[{cid}] ✘ Could not write traceback log: {e}")
-                    entry = f"{now.is8601()} UTC  Restarted '{cid}' (traceback) → '{outfile.name}'\n"
+                    entry = f"{now.isoformat()} UTC  Restarted '{cid}' (traceback) → '{outfile.name}'\n"
                     try: master_log.write_text(master_log.read_text()+entry, encoding="utf-8")
                     except Exception as e: print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
                     try: container.restart(); print(f"[{cid}] ✔ Restarted due to Python traceback detected in logs")
@@ -299,7 +316,7 @@ def main():
                     outfile = log_dir / f"{cid}_pingfail_{ts_str}.log"
                     try: outfile.write_text(pre_text, encoding="utf-8")
                     except Exception as e: print(f"[{cid}] ✘ Could not write pingfail log: {e}")
-                    entry = f"{now.is8601()} UTC  Restarted '{cid}' (pingfail) → '{outfile.name}'\n"
+                    entry = f"{now.isoformat()} UTC  Restarted '{cid}' (pingfail) → '{outfile.name}'\n"
                     try: master_log.write_text(master_log.read_text()+entry, encoding="utf-8")
                     except Exception as e: print(f"[{cid}] ✘ Could not append to watcher.log: {e}")
                     try: container.restart(); print(f"[{cid}] ✔ Restarted due to repeated “Pinging network…”")
