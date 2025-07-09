@@ -1,20 +1,21 @@
-version: "3.8"
+version: '3.8'
 
 services:
   watcher:
     build:
       context: .
       dockerfile: Dockerfile
-    image: node_watch:latest
-    container_name: node_watch
+    image: watcher-image:latest
+    container_name: node_watcher
     restart: unless-stopped
-
-    # Bind‐mount the host's Docker socket so the watcher can inspect/restart containers.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./:/app
-    tty: true  
+      - ./:/app:rw
+    environment:
+      PYTHONUNBUFFERED: '1'
+    networks:
+      - docker-host
 
-
-    # The watcher script itself prints to stdout. If you want to see tlogs:
-    # docker-compose logs -f watcher
+networks:
+  docker-host:
+    driver: bridge
