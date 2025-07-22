@@ -16,5 +16,17 @@
   "stats_api_url": "https://db-be-6.cortensor.network/network-stats-tasks",
   "reputation_api_url": "https://db-be-6.cortensor.network/reputation",
   "session_reputation_api_url": "https://db-be-6.cortensor.network/session-reputation",
-  "tx_timeout_seconds": 30
+  "tx_timeout_seconds": 60,
+  "restart_flags": {
+    "traceback": true,
+    "traceback_unrecovered": true,
+    "pingfail": true,
+    "node_pool_stale": true,
+    "lag": true,
+    "precommit_timeout": true,
+    "commit_timeout": true,
+    "sesspre_timeout": true,
+    "sesscom_timeout": true,
+    "tx_failure": true
+  }  
 }
